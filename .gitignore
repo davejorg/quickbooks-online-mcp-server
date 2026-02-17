@@ -2,3 +2,7 @@
 
 node_modules
 dist
+.token-state.json
+.token-state.json.tmp
+.env
+token-bootstrap.mjs

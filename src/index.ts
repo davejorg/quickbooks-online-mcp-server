@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 
+import http from "node:http";
+import { URL } from "node:url";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { QuickbooksMCPServer } from "./server/qbo-mcp-server.js";
 // import { ListInvoicesTool } from "./tools/list-invoices.tool.js";
 // import { CreateCustomerTool } from "./tools/create-customer.tool.js";
@@ -66,99 +69,198 @@ import { UpdatePurchaseTool } from "./tools/update-purchase.tool.js";
 import { DeletePurchaseTool } from "./tools/delete-purchase.tool.js";
 import { SearchPurchasesTool } from "./tools/search-purchases.tool.js";
 
-const main = async () => {
-  // Create an MCP server
-  const server = QuickbooksMCPServer.GetServer();
-  // Add tools for customers
+type TransportMode = "stdio" | "sse";
+
+const registerTools = (server: ReturnType<typeof QuickbooksMCPServer.GetServer>) => {
+  // Customers
   RegisterTool(server, CreateCustomerTool);
   RegisterTool(server, GetCustomerTool);
   RegisterTool(server, UpdateCustomerTool);
   RegisterTool(server, DeleteCustomerTool);
   RegisterTool(server, SearchCustomersTool);
-  // Add tools for estimates
+  // Estimates
   RegisterTool(server, CreateEstimateTool);
   RegisterTool(server, GetEstimateTool);
   RegisterTool(server, UpdateEstimateTool);
   RegisterTool(server, DeleteEstimateTool);
   RegisterTool(server, SearchEstimatesTool);
-  
-  // Add tools for bills
+  // Bills
   RegisterTool(server, CreateBillTool);
   RegisterTool(server, UpdateBillTool);
   RegisterTool(server, DeleteBillTool);
   RegisterTool(server, GetBillTool);
   RegisterTool(server, SearchBillsTool);
-
-
-  // Add tool to read a single invoice
+  // Invoices
   RegisterTool(server, ReadInvoiceTool);
-
-  // Add tool to search invoices
   RegisterTool(server, SearchInvoicesTool);
-
-  // Add tool to create invoice
   RegisterTool(server, CreateInvoiceTool);
-
-  // Add tool to update invoice
   RegisterTool(server, UpdateInvoiceTool);
-
-  // Chart of accounts tools
+  // Chart of accounts
   RegisterTool(server, CreateAccountTool);
   RegisterTool(server, UpdateAccountTool);
   RegisterTool(server, SearchAccountsTool);
-
-  // Add tool to read item
+  // Items
   RegisterTool(server, ReadItemTool);
   RegisterTool(server, SearchItemsTool);
   RegisterTool(server, CreateItemTool);
   RegisterTool(server, UpdateItemTool);
-
-  // // Add a tool to create a customer
-  // RegisterTool(server, CreateCustomerTool);
-
-  // // Add tool to list accounts
-  // RegisterTool(server, ListAccountsTool);
-
-  // // Add tool to update a customer
-  // RegisterTool(server, UpdateCustomerTool);
-
-  // Add tools for vendors
+  // Vendors
   RegisterTool(server, CreateVendorTool);
   RegisterTool(server, UpdateVendorTool);
   RegisterTool(server, DeleteVendorTool);
   RegisterTool(server, GetVendorTool);
   RegisterTool(server, SearchVendorsTool);
-
-  // Add tools for employees
+  // Employees
   RegisterTool(server, CreateEmployeeTool);
   RegisterTool(server, GetEmployeeTool);
   RegisterTool(server, UpdateEmployeeTool);
   RegisterTool(server, SearchEmployeesTool);
-
-  // Add tools for journal entries
+  // Journal entries
   RegisterTool(server, CreateJournalEntryTool);
   RegisterTool(server, GetJournalEntryTool);
   RegisterTool(server, UpdateJournalEntryTool);
   RegisterTool(server, DeleteJournalEntryTool);
   RegisterTool(server, SearchJournalEntriesTool);
-
-  // Add tools for bill payments
+  // Bill payments
   RegisterTool(server, CreateBillPaymentTool);
   RegisterTool(server, GetBillPaymentTool);
   RegisterTool(server, UpdateBillPaymentTool);
   RegisterTool(server, DeleteBillPaymentTool);
   RegisterTool(server, SearchBillPaymentsTool);
-
-  // Add tools for purchases
+  // Purchases
   RegisterTool(server, CreatePurchaseTool);
   RegisterTool(server, GetPurchaseTool);
   RegisterTool(server, UpdatePurchaseTool);
   RegisterTool(server, DeletePurchaseTool);
   RegisterTool(server, SearchPurchasesTool);
+};
 
-  // Start receiving messages on stdin and sending messages on stdout
+const parseArgs = () => {
+  const args = process.argv.slice(2);
+  let transport: TransportMode = "stdio";
+  let host = "127.0.0.1";
+  let port = 8812;
+
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === "--transport") {
+      const next = args[i + 1];
+      if (next !== "stdio" && next !== "sse") {
+        throw new Error(`Invalid transport: ${next ?? "(missing)"}`);
+      }
+      transport = next;
+      i += 1;
+      continue;
+    }
+    if (arg === "--host") {
+      host = args[i + 1] ?? host;
+      i += 1;
+      continue;
+    }
+    if (arg === "--port") {
+      const next = Number.parseInt(args[i + 1] ?? "", 10);
+      if (!Number.isFinite(next) || next <= 0 || next > 65535) {
+        throw new Error(`Invalid port: ${args[i + 1] ?? "(missing)"}`);
+      }
+      port = next;
+      i += 1;
+      continue;
+    }
+    if (arg === "-h" || arg === "--help") {
+      console.log("Usage: quickbooks-mcp [--transport stdio|sse] [--host 127.0.0.1] [--port 8812]");
+      process.exit(0);
+    }
+    throw new Error(`Unknown argument: ${arg}`);
+  }
+
+  return { transport, host, port };
+};
+
+const startStdio = async () => {
+  const server = QuickbooksMCPServer.GetServer();
+  registerTools(server);
   const transport = new StdioServerTransport();
   await server.connect(transport);
+};
+
+const startSse = async (host: string, port: number) => {
+  const sessions = new Map<string, SSEServerTransport>();
+
+  const webServer = http.createServer(async (req, res) => {
+    try {
+      if (!req.url) {
+        res.writeHead(400).end("Missing URL");
+        return;
+      }
+
+      const url = new URL(req.url, `http://${host}:${port}`);
+
+      if (req.method === "GET" && url.pathname === "/health") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname === "/sse") {
+        const transport = new SSEServerTransport("/message", res);
+        const server = QuickbooksMCPServer.GetServer();
+        registerTools(server);
+
+        transport.onclose = () => {
+          sessions.delete(transport.sessionId);
+        };
+        transport.onerror = (error) => {
+          console.error("SSE transport error:", error);
+        };
+
+        sessions.set(transport.sessionId, transport);
+        await server.connect(transport);
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname === "/message") {
+        const sessionId = url.searchParams.get("sessionId");
+        if (!sessionId) {
+          res.writeHead(400).end("Missing sessionId");
+          return;
+        }
+        const transport = sessions.get(sessionId);
+        if (!transport) {
+          res.writeHead(404).end("Session not found");
+          return;
+        }
+        await transport.handlePostMessage(req, res);
+        return;
+      }
+
+      res.writeHead(404).end("Not found");
+    } catch (error) {
+      console.error("Request error:", error);
+      if (!res.headersSent) {
+        res.writeHead(500).end("Internal server error");
+      } else {
+        res.end();
+      }
+    }
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    webServer.once("error", reject);
+    webServer.listen(port, host, () => resolve());
+  });
+
+  console.error(`QuickBooks MCP SSE server listening on http://${host}:${port}/sse`);
+};
+
+const main = async () => {
+  const { transport, host, port } = parseArgs();
+
+  if (transport === "sse") {
+    await startSse(host, port);
+    return;
+  }
+
+  await startStdio();
 };
 
 main().catch((error) => {

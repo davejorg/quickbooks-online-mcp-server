@@ -3,6 +3,7 @@ import QuickBooks from "node-quickbooks";
 import OAuthClient from "intuit-oauth";
 import http from 'http';
 import fs from 'fs';
+import fsp from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import open from 'open';
@@ -34,6 +35,7 @@ class QuickbooksClient {
   private oauthClient: OAuthClient;
   private isAuthenticating: boolean = false;
   private redirectUri: string;
+  private refreshPromise: Promise<{ access_token: string; expires_in: number }> | null = null;
 
   constructor(config: {
     clientId: string;
@@ -55,6 +57,97 @@ class QuickbooksClient {
       environment: this.environment,
       redirectUri: this.redirectUri,
     });
+    this.loadTokenState();
+  }
+
+  private get tokenStatePath(): string {
+    return path.join(__dirname, '..', '..', '.token-state.json');
+  }
+
+  private get tokenStateLockPath(): string {
+    return `${this.tokenStatePath}.lock`;
+  }
+
+  private loadTokenState(): void {
+    try {
+      const data = fs.readFileSync(this.tokenStatePath, 'utf-8');
+      const state = JSON.parse(data);
+      if (state.refresh_token) this.refreshToken = state.refresh_token;
+      if (state.realm_id) this.realmId = state.realm_id;
+      if (state.access_token) this.accessToken = state.access_token;
+      if (state.access_token_expiry) this.accessTokenExpiry = new Date(state.access_token_expiry);
+    } catch {
+      // No persisted state or read error — fall back to env vars (already set)
+    }
+  }
+
+  private persistTokenState(): void {
+    const state = {
+      refresh_token: this.refreshToken,
+      realm_id: this.realmId,
+      access_token: this.accessToken,
+      access_token_expiry: this.accessTokenExpiry?.toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    const tmpPath = this.tokenStatePath + '.tmp';
+    fs.writeFileSync(tmpPath, JSON.stringify(state, null, 2), { mode: 0o600 });
+    fs.renameSync(tmpPath, this.tokenStatePath);
+  }
+
+  private async acquireTokenStateLock(
+    timeoutMs = 15000,
+    staleMs = 120000,
+    pollMs = 200,
+  ): Promise<() => Promise<void>> {
+    const startedAt = Date.now();
+    const lockContent = JSON.stringify({
+      pid: process.pid,
+      created_at: new Date().toISOString(),
+    });
+
+    while (Date.now() - startedAt <= timeoutMs) {
+      try {
+        const handle = await fsp.open(this.tokenStateLockPath, 'wx', 0o600);
+        try {
+          await handle.writeFile(lockContent, 'utf8');
+        } finally {
+          await handle.close();
+        }
+
+        let released = false;
+        return async () => {
+          if (released) return;
+          released = true;
+          try {
+            await fsp.unlink(this.tokenStateLockPath);
+          } catch (error: any) {
+            if (error?.code !== 'ENOENT') {
+              throw error;
+            }
+          }
+        };
+      } catch (error: any) {
+        if (error?.code !== 'EEXIST') {
+          throw error;
+        }
+      }
+
+      try {
+        const stat = await fsp.stat(this.tokenStateLockPath);
+        if (Date.now() - stat.mtimeMs > staleMs) {
+          await fsp.unlink(this.tokenStateLockPath);
+          continue;
+        }
+      } catch (error: any) {
+        if (error?.code !== 'ENOENT') {
+          throw error;
+        }
+      }
+
+      await new Promise<void>((resolve) => setTimeout(resolve, pollMs));
+    }
+
+    throw new Error(`Timed out acquiring QuickBooks token lock after ${timeoutMs}ms`);
   }
 
   private async startOAuthFlow(): Promise<void> {
@@ -77,6 +170,7 @@ class QuickbooksClient {
             this.refreshToken = tokens.refresh_token;
             this.realmId = tokens.realmId;
             this.saveTokensToEnv();
+            this.persistTokenState();
             
             // Send success response
             res.writeHead(200, { 'Content-Type': 'text/html' });
@@ -172,32 +266,83 @@ class QuickbooksClient {
     fs.writeFileSync(tokenPath, envLines.join('\n'));
   }
 
-  async refreshAccessToken() {
-    if (!this.refreshToken) {
-      await this.startOAuthFlow();
-      
-      // Verify we have a refresh token after OAuth flow
-      if (!this.refreshToken) {
-        throw new Error('Failed to obtain refresh token from OAuth flow');
-      }
-    }
+  async refreshAccessToken(): Promise<{ access_token: string; expires_in: number }> {
+    // Mutex: coalesce concurrent refresh calls onto a single request
+    if (this.refreshPromise) return this.refreshPromise;
 
+    this.refreshPromise = this._doRefresh();
     try {
-      // At this point we know refreshToken is not undefined
-      const authResponse = await this.oauthClient.refreshUsingToken(this.refreshToken);
-      
-      this.accessToken = authResponse.token.access_token;
-      
-      // Calculate expiry time
-      const expiresIn = authResponse.token.expires_in || 3600; // Default to 1 hour
-      this.accessTokenExpiry = new Date(Date.now() + expiresIn * 1000);
-      
-      return {
-        access_token: this.accessToken,
-        expires_in: expiresIn,
-      };
-    } catch (error: any) {
-      throw new Error(`Failed to refresh Quickbooks token: ${error.message}`);
+      return await this.refreshPromise;
+    } finally {
+      this.refreshPromise = null;
+    }
+  }
+
+  private async _doRefresh(): Promise<{ access_token: string; expires_in: number }> {
+    const releaseLock = await this.acquireTokenStateLock();
+    try {
+      // Always reload persisted state before refresh to avoid stale in-memory tokens.
+      this.loadTokenState();
+
+      if (!this.refreshToken) {
+        await this.startOAuthFlow();
+        this.loadTokenState();
+        if (!this.refreshToken) {
+          throw new Error('Failed to obtain refresh token from OAuth flow');
+        }
+      }
+
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const tokenUsed: string = this.refreshToken ?? '';
+        if (!tokenUsed) {
+          throw new Error('Missing refresh token');
+        }
+
+        try {
+          const authResponse = await this.oauthClient.refreshUsingToken(tokenUsed);
+
+          this.accessToken = authResponse.token.access_token;
+          this.refreshToken = authResponse.token.refresh_token;
+
+          const expiresIn = authResponse.token.expires_in || 3600;
+          this.accessTokenExpiry = new Date(Date.now() + expiresIn * 1000);
+          this.persistTokenState();
+
+          const refreshExpirySeconds = authResponse.token.x_refresh_token_expires_in;
+          if (refreshExpirySeconds && refreshExpirySeconds < 30 * 24 * 3600) {
+            const days = Math.round(refreshExpirySeconds / 86400);
+            console.warn(`[QuickBooks] Refresh token expires in ${days} days — re-authorize soon`);
+          }
+
+          return { access_token: this.accessToken, expires_in: expiresIn };
+        } catch (error: any) {
+          const msg = error?.message || String(error);
+          if (!msg.includes('invalid_grant')) {
+            throw new Error(`Failed to refresh Quickbooks token: ${msg}`);
+          }
+
+          // If another process already rotated token, reload state and retry once.
+          this.loadTokenState();
+          if (attempt === 0 && this.refreshToken && this.refreshToken !== tokenUsed) {
+            console.warn('[QuickBooks] Detected newer refresh token in state file, retrying refresh once');
+            continue;
+          }
+
+          console.warn('[QuickBooks] invalid_grant — starting OAuth re-authorization flow');
+          this.refreshToken = undefined;
+          this.accessToken = undefined;
+          this.accessTokenExpiry = undefined;
+          await this.startOAuthFlow();
+          this.loadTokenState();
+          if (!this.refreshToken) {
+            throw new Error('Failed to re-authorize after invalid_grant');
+          }
+        }
+      }
+
+      throw new Error('Failed to refresh Quickbooks token after retry');
+    } finally {
+      await releaseLock();
     }
   }
 
