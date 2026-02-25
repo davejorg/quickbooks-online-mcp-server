@@ -24,21 +24,17 @@ const customerFieldEnum = z.enum([
 );
 
 const criterionSchema = z.object({
-  key: z.string().describe("Simple key (legacy) – any Customer property name."),
-  value: z.union([z.string(), z.boolean()]),
-});
-
-const advancedCriterionSchema = z.object({
-  field: customerFieldEnum,
-  value: z.union([z.string(), z.boolean()]),
+  key: z.string().optional().describe("Simple key (legacy) – any Customer property name."),
+  field: customerFieldEnum.optional(),
+  value: z.any(),
   operator: z.enum(["=", "<", ">", "<=", ">=", "LIKE", "IN"]).optional(),
-});
+}).passthrough();
 
 const toolSchema = z.object({
   // Criteria can be passed as list of key/value/operator triples (array form)
   // or omitted for unfiltered search.
   criteria: z
-    .array(advancedCriterionSchema.or(criterionSchema))
+    .array(criterionSchema)
     .optional()
     .describe(
       "Filters to apply. Use the advanced form {field,value,operator?} for operators or the simple {key,value} pairs."

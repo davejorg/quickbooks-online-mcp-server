@@ -1,0 +1,144 @@
+diff --git a/src/clients/quickbooks-client.ts b/src/clients/quickbooks-client.ts
+index a954baf..59b9b37 100644
+--- a/src/clients/quickbooks-client.ts
++++ b/src/clients/quickbooks-client.ts
+@@ -13,10 +13,11 @@ dotenv.config();
+ const __dirname = path.dirname(fileURLToPath(import.meta.url));
+ const client_id = process.env.QUICKBOOKS_CLIENT_ID;
+ const client_secret = process.env.QUICKBOOKS_CLIENT_SECRET;
+-const refresh_token = process.env.QUICKBOOKS_REFRESH_TOKEN;
+ const realm_id = process.env.QUICKBOOKS_REALM_ID;
+ const environment = process.env.QUICKBOOKS_ENVIRONMENT || 'sandbox';
+ const redirect_uri = 'http://localhost:8000/callback';
++const allowEnvRefreshFallback = process.env.QUICKBOOKS_ALLOW_ENV_REFRESH_FALLBACK === '1';
++const writeEnvMetadata = process.env.QUICKBOOKS_WRITE_ENV_METADATA === '1';
+ 
+ // Only throw error if client_id or client_secret is missing
+ if (!client_id || !client_secret || !redirect_uri) {
+@@ -40,14 +41,12 @@ class QuickbooksClient {
+   constructor(config: {
+     clientId: string;
+     clientSecret: string;
+-    refreshToken?: string;
+     realmId?: string;
+     environment: string;
+     redirectUri: string;
+   }) {
+     this.clientId = config.clientId;
+     this.clientSecret = config.clientSecret;
+-    this.refreshToken = config.refreshToken;
+     this.realmId = config.realmId;
+     this.environment = config.environment;
+     this.redirectUri = config.redirectUri;
+@@ -69,15 +68,24 @@ class QuickbooksClient {
+   }
+ 
+   private loadTokenState(): void {
++    let loadedFromState = false;
+     try {
+       const data = fs.readFileSync(this.tokenStatePath, 'utf-8');
+       const state = JSON.parse(data);
+-      if (state.refresh_token) this.refreshToken = state.refresh_token;
++      if (state.refresh_token) {
++        this.refreshToken = state.refresh_token;
++        loadedFromState = true;
++      }
+       if (state.realm_id) this.realmId = state.realm_id;
+       if (state.access_token) this.accessToken = state.access_token;
+       if (state.access_token_expiry) this.accessTokenExpiry = new Date(state.access_token_expiry);
+     } catch {
+-      // No persisted state or read error — fall back to env vars (already set)
++      // No persisted token state available.
++    }
++
++    if (!loadedFromState && !this.refreshToken && allowEnvRefreshFallback && process.env.QUICKBOOKS_REFRESH_TOKEN) {
++      this.refreshToken = process.env.QUICKBOOKS_REFRESH_TOKEN;
++      console.warn('[QuickBooks] Using QUICKBOOKS_REFRESH_TOKEN env fallback (QUICKBOOKS_ALLOW_ENV_REFRESH_FALLBACK=1)');
+     }
+   }
+ 
+@@ -247,7 +255,15 @@ class QuickbooksClient {
+   }
+ 
+   private saveTokensToEnv(): void {
++    if (!writeEnvMetadata) {
++      return;
++    }
++
+     const tokenPath = path.join(__dirname, '..', '..', '.env');
++    if (!fs.existsSync(tokenPath)) {
++      return;
++    }
++
+     const envContent = fs.readFileSync(tokenPath, 'utf-8');
+     const envLines = envContent.split('\n');
+     
+@@ -260,7 +276,6 @@ class QuickbooksClient {
+       }
+     };
+ 
+-    if (this.refreshToken) updateEnvVar('QUICKBOOKS_REFRESH_TOKEN', this.refreshToken);
+     if (this.realmId) updateEnvVar('QUICKBOOKS_REALM_ID', this.realmId);
+ 
+     fs.writeFileSync(tokenPath, envLines.join('\n'));
+@@ -285,11 +300,9 @@ class QuickbooksClient {
+       this.loadTokenState();
+ 
+       if (!this.refreshToken) {
+-        await this.startOAuthFlow();
+-        this.loadTokenState();
+-        if (!this.refreshToken) {
+-          throw new Error('Failed to obtain refresh token from OAuth flow');
+-        }
++        throw new Error(
++          'Missing refresh token state. Run `node token-bootstrap.mjs` (or `node token-bootstrap.mjs --oauth`) to initialize .token-state.json.',
++        );
+       }
+ 
+       for (let attempt = 0; attempt < 2; attempt += 1) {
+@@ -328,15 +341,10 @@ class QuickbooksClient {
+             continue;
+           }
+ 
+-          console.warn('[QuickBooks] invalid_grant — starting OAuth re-authorization flow');
+-          this.refreshToken = undefined;
+-          this.accessToken = undefined;
+-          this.accessTokenExpiry = undefined;
+-          await this.startOAuthFlow();
+-          this.loadTokenState();
+-          if (!this.refreshToken) {
+-            throw new Error('Failed to re-authorize after invalid_grant');
+-          }
++          console.warn('[QuickBooks] invalid_grant detected for current refresh token');
++          throw new Error(
++            'QuickBooks refresh token rejected (invalid_grant). Re-authorize with `node token-bootstrap.mjs --oauth` to rotate .token-state.json.',
++          );
+         }
+       }
+ 
+@@ -347,13 +355,11 @@ class QuickbooksClient {
+   }
+ 
+   async authenticate() {
++    this.loadTokenState();
+     if (!this.refreshToken || !this.realmId) {
+-      await this.startOAuthFlow();
+-      
+-      // Verify we have both tokens after OAuth flow
+-      if (!this.refreshToken || !this.realmId) {
+-        throw new Error('Failed to obtain required tokens from OAuth flow');
+-      }
++      throw new Error(
++        'QuickBooks token state is incomplete. Ensure .token-state.json contains refresh_token and realm_id. Run `node token-bootstrap.mjs`.',
++      );
+     }
+ 
+     // Check if token exists and is still valid
+@@ -391,7 +397,6 @@ class QuickbooksClient {
+ export const quickbooksClient = new QuickbooksClient({
+   clientId: client_id,
+   clientSecret: client_secret,
+-  refreshToken: refresh_token,
+   realmId: realm_id,
+   environment: environment,
+   redirectUri: redirect_uri,
